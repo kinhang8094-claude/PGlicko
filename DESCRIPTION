@@ -1,0 +1,31 @@
+Package: PGlicko
+Type: Package
+Title: Glicko and Pairwise Glicko (P-Glicko) Rating Systems for Intransitive Competitions
+Version: 0.1.0
+Authors@R:
+    person("K.H.", "Wong", , "kinhang@wayne.edu", role = c("aut", "cre"))
+Description: Rates players in head-to-head competitions with the Glicko system
+    and with P-Glicko, an extension that adds a pairwise strength and a pairwise
+    rating deviation for every pair of players, so that win probabilities need not
+    be transitive (A can be favoured over B, B over C and C over A). Ratings are
+    updated period by period, with Glicko rating-deviation growth between periods.
+    Includes maximum-likelihood fitting of the initial deviations, walk-forward
+    prediction, evaluation on held-out periods, and continuation of a rating run
+    with new data. Pairwise parameters are stored only for pairs that have played,
+    so memory grows with the number of pairs that meet, not with the square of the
+    number of players.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Depends:
+    R (>= 3.5.0)
+Imports:
+    stats
+Suggests:
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+LazyData: true

@@ -1,0 +1,9 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^data-raw$
+^Glicko_functions_optimized_v[0-9]+\.R$
+^PGlicko_functions_optimized_v[0-9]+\.R$
+^Train_all_models\.R$
+^Prob_recovery_all_models__for_simulations_only_\.R$
+^README\.md$
+^LICENSE\.md$

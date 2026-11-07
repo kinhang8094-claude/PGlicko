@@ -1,0 +1,399 @@
+---
+title: "Glicko and P-Glicko ratings with PGlicko"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Glicko and P-Glicko ratings with PGlicko}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(digits = 4)
+```
+
+```{r setup}
+library(PGlicko)
+```
+
+PGlicko rates players in head-to-head competitions with two systems:
+
+* **Glicko** (Glickman, 1999). Each player has a rating $\mu_i$ and a rating
+  deviation (RD) $\sigma_i$ that measures how uncertain the rating is.
+* **P-Glicko**. Every *pair* of players $(i, j)$ also gets a pairwise strength
+  $\beta_{ij}$ and a pairwise deviation $b_{ij}$. With these, win probabilities
+  need not be transitive: A can be favoured over B, B over C, and C over A.
+
+This vignette covers:
+
+1. the model and its equations;
+2. the data format;
+3. running the ratings;
+4. fitting the two initial deviations by maximum likelihood;
+5. evaluating on held-out games;
+6. continuing a run with new data;
+7. predicting new games;
+8. practical notes (RD growth, memory);
+9. how the package functions map onto the original research scripts.
+
+# 1. The model
+
+## Notation
+
+* Rating periods are indexed by $t$. All games within a period are treated as
+  played at the same time: each one is evaluated with the ratings from the start
+  of the period, and all updates are applied together at the end.
+* The scale constants are $q = \ln(10)/400$ and
+  $g(\sigma) = 1/\sqrt{1 + 3q^2\sigma^2/\pi^2}$ (available as `glicko_g()`).
+  $g$ shrinks a rating difference towards zero when the ratings involved are
+  uncertain.
+* $s \in \{0, \tfrac12, 1\}$ is the score of player $i$ in a game against $j$.
+
+## RD growth between periods
+
+At the start of every period, each player who has already played has their
+deviation increased:
+
+$$\sigma_i \leftarrow \min\left(\sqrt{\sigma_i^2 + c^2},\ \sigma_{\max}\right),$$
+
+with $c$ = `c_rd` (default 63.2) and $\sigma_{\max}$ = `rd_max` (default 350).
+New players start at `init_rating` (default 1500) and RD $\sigma_0$ = `init_sd`.
+
+## Glicko update
+
+For player $i$, sum over the games $i$ plays in the period, against opponents $j$:
+
+$$E_{ij} = \frac{1}{1 + 10^{-g(\sigma_j)(\mu_i - \mu_j)/400}}$$
+
+$$\sigma_i' = \min\left(\sigma_{\max},\ \left(\frac{1}{\sigma_i^2} + q^2\sum_j g(\sigma_j)^2E_{ij}(1-E_{ij})\right)^{-1/2}\right)$$
+
+$$\mu_i' = \mu_i + q\,\sigma_i'^2\sum_j g(\sigma_j)\,(s_{ij} - E_{ij})$$
+
+## P-Glicko update
+
+**Players.** The player update has the same form as Glicko's, but the pairwise
+values enter the expected score and the attenuation (eqs 16–21 of the P-Glicko
+paper):
+
+$$E_{ij} = \frac{1}{1 + 10^{-g\left(\sqrt{\sigma_j^2 + b_{ij}^2}\right)(\mu_i + \beta_{ij} - \mu_j)/400}}$$
+
+with $g\left(\sqrt{\sigma_j^2 + b_{ij}^2}\right)$ in place of $g(\sigma_j)$ in the
+$\sigma'$ and $\mu'$ formulas above.
+
+**Pairs.** Each pair that played in the period pools its $n_{ij}$ games
+(eqs 28–32). Here $g_{ij} = g\left(\sqrt{\sigma_i^2 + \sigma_j^2}\right)$ and
+
+$$E_{ij} = \frac{1}{1 + 10^{-g_{ij}(\mu_i + \beta_{ij} - \mu_j)/400}}.$$
+
+The updates are:
+
+$$b_{ij}' = \min\left(\sigma_{\max},\ \left(\frac{1}{b_{ij}^2} + q^2 n_{ij}\, g_{ij}^2E_{ij}(1-E_{ij})\right)^{-1/2}\right)$$
+
+$$\beta_{ij}' = \beta_{ij} + q\, b_{ij}'^2\, g_{ij}\sum (s_{ij} - E_{ij})$$
+
+The pairwise strength is antisymmetric and the deviation symmetric:
+$\beta_{ji} = -\beta_{ij}$ and $b_{ji} = b_{ij}$. A new pair starts at
+$\beta = 0$ and $b = b_0$ = `init_pair_sd`. Pairwise deviations do not grow
+between periods.
+
+## Win probability
+
+$$P(i \text{ beats } j) = \frac{1}{1 + 10^{-g\left(\sqrt{\sigma_i^2 + \sigma_j^2 + b_{ij}^2}\right)(\mu_i + \beta_{ij} - \mu_j)/400}}$$
+
+This is eq. 34 of the paper. With $\beta = b = 0$ it reduces to Glicko's eq. 33.
+`win_probability()` computes it:
+
+```{r}
+win_probability(1600, 60, 1500, 60)                                     # Glicko
+win_probability(1600, 60, 1500, 60, pair_strength = -150, pair_sd = 50) # P-Glicko
+```
+
+# 2. Data
+
+A data set has one row per game, with four columns:
+
+| column        | meaning                                                        |
+|---------------|----------------------------------------------------------------|
+| `Season`      | rating period; any sortable values, processed in sorted order  |
+| `Player1`     | player name or ID (converted to character)                     |
+| `Player2`     | opponent                                                       |
+| `Game_Result` | 1 if Player1 won, 0 if Player1 lost, 0.5 for a draw            |
+
+`as_match_data()` builds this from a data frame with other column names, or
+from columns given by position or name. It also checks the data: results must be
+0, 0.5 or 1, there must be no missing values, and nobody may play themselves.
+
+```{r}
+raw <- data.frame(week = c(1, 1, 2), home = c("A", "B", "A"),
+                  away = c("B", "C", "C"), home_won = c(1, 0, 1))
+as_match_data(raw, season = "week", player1 = "home", player2 = "away",
+              result = "home_won")
+```
+
+The package includes `rps_league`, a simulated league built to show
+intransitivity. It has 8 players, 60 periods and 28 games per period
+(1,680 games):
+
+* Rock, Paper and Scissors have equal overall strength, but each beats the next
+  in the cycle with a +250 pairwise advantage;
+* Ace, Bolt, Cruz, Dune and Echo are an ordinary transitive ladder
+  (+150, +60, 0, −60, −150).
+
+`rps_truth` holds the true strengths and win probabilities for every pair.
+
+```{r}
+data(rps_league)
+head(rps_league)
+data(rps_truth)
+head(rps_truth[order(-abs(rps_truth$pair_effect)), ], 4)
+```
+
+# 3. Running the ratings
+
+`glicko_run()` and `pglicko_run()` rate every player period by period with
+fixed parameters:
+
+```{r}
+g <- glicko_run(rps_league, init_sd = 80, c_rd = 0)
+p <- pglicko_run(rps_league, init_sd = 50, init_pair_sd = 90, c_rd = 0)
+p
+```
+
+The result is a `pglicko_ratings` object. It holds:
+
+* `ratings`: one row per player, with rating, RD, games, wins, losses, periods
+  since the player last played, and whether the player has played;
+* `pairs` (P-Glicko only): one row per pair that has played;
+* `predictions`: the walk-forward probability for every game, made before that
+  game's period was used;
+* `periods`, `params`, and optionally `history`.
+
+```{r}
+p$ratings
+head(p$pairs[order(-abs(p$pairs$PairStrength)), ])
+```
+
+Each row of `pairs` gives the pairwise strength of `Player1` over `Player2`. The
+reverse direction is its negative. `pair_matrix()` turns the table into a square
+matrix:
+
+```{r}
+round(pair_matrix(p, players = c("Rock", "Paper", "Scissors", "Ace", "Echo")))
+```
+
+P-Glicko finds the cycle: Paper over Rock, Scissors over Paper, and Rock over
+Scissors, each by a large margin. These are the largest pairwise values, and
+their signs go round the cycle, which no set of ratings can produce.
+
+The ladder pairs (for example Ace–Echo) also get non-zero pairwise values. A
+rating difference and a pairwise strength both explain the same games, and the
+data cannot fully tell them apart. P-Glicko ratings therefore look compressed
+next to Glicko's, with the pairwise values making up the rest. So read
+$\mu_i + \beta_{ij} - \mu_j$, or the predicted probabilities (section 7),
+rather than either part alone.
+
+Glicko cannot express the cycle, so it gives the three cycle players similar
+ratings:
+
+```{r}
+g$ratings[, c("Player", "Rating", "SD")]
+```
+
+With `keep_history = TRUE`, the run also returns each player's rating and RD at
+the end of every period:
+
+```{r, fig.width = 6.5, fig.height = 3.6}
+h <- pglicko_run(rps_league, 50, 90, c_rd = 0, keep_history = TRUE)$history
+matplot(h$rating, type = "l", lty = 1, xlab = "period", ylab = "rating",
+        main = "P-Glicko ratings over time")
+legend("topleft", colnames(h$rating), col = 1:6, lty = 1, ncol = 4, cex = 0.7,
+       bty = "n")
+```
+
+# 4. Fitting the initial deviations
+
+The free parameters are $\sigma_0$ (Glicko) and $(\sigma_0, b_0)$ (P-Glicko).
+They are estimated by maximising the log-likelihood of the training games, which
+are the first `train_frac` (default 80%) of rows, in row order.
+
+To match the empirical study in the P-Glicko paper, the likelihood uses
+`prediction = "lagged_mean"`:
+
+* each player's rating is the mean of their ratings over the previous `window`
+  (default 6) periods;
+* RDs and pairwise values are those at the end of the previous period;
+* games in the first `window` periods get probability 0.5.
+
+`prediction = "current"` uses the ratings at the start of the game's period
+instead.
+
+```{r}
+glicko_loglik(80, rps_league, c_rd = 0)
+pglicko_loglik(c(50, 90), rps_league, c_rd = 0, metric = "all")
+```
+
+`glicko_fit()` maximises this with `optimize()` and `pglicko_fit()` with
+`optim()`. Both report the test-game measures at the optimum, plus a trace of
+every evaluation:
+
+```{r}
+fg <- glicko_fit(rps_league, c_rd = 0)
+fp <- pglicko_fit(rps_league, c_rd = 0)
+fg
+fp
+head(fp$trace)
+```
+
+# 5. Evaluating on held-out games
+
+The whole data set is rated, and the split only decides which games count
+towards the likelihood (training) and which towards the test measures. No
+prediction uses its own game or any later game, so the test measures are out of
+sample. `fit$test` reports:
+
+* log loss (mean negative log-likelihood per game);
+* Brier score;
+* AUC;
+* accuracy (threshold 0.5).
+
+```{r}
+rbind(Glicko = unlist(fg$test), PGlicko = unlist(fp$test))
+```
+
+On `rps_league`, P-Glicko has the lower test log loss and Brier score, because
+only P-Glicko can model the cycle.
+
+The AUC has a fixed direction: a higher predicted probability should mean
+Player1 won, so an AUC below 0.5 means worse than chance. `pROC::auc()` with its
+default `direction = "auto"` instead flips the direction whenever that gives a
+larger value. It reports $1 - \text{AUC}$ in such cases, which is why some
+numbers from the original scripts can differ.
+
+To use a different split, set `train_frac`, or reorder the rows so the test
+games come last. `train_frac = 1` uses every game for fitting.
+
+# 6. Continuing a run
+
+`start` continues from an earlier run's final state, for example from training
+into test periods, or week by week as results arrive. The earlier run's players
+keep their ratings, RDs, counts and pairwise values. Players and pairs that are
+new start from the initial values. Running in pieces gives the same result as
+one run over everything:
+
+```{r}
+early <- rps_league[rps_league$Season <= 40, ]
+late  <- rps_league[rps_league$Season >  40, ]
+p1 <- pglicko_run(early, 50, 90, c_rd = 0)
+p2 <- pglicko_run(late,  50, 90, c_rd = 0, start = p1)
+full <- pglicko_run(rps_league, 50, 90, c_rd = 0)
+m <- match(full$ratings$Player, p2$ratings$Player)
+all.equal(p2$ratings$Rating[m], full$ratings$Rating)
+all.equal(p2$predictions, full$predictions[rps_league$Season > 40])
+```
+
+# 7. Predicting new games
+
+`predict()` gives the probability that `Player1` beats `Player2`, using the
+final state of a run. The ratings are not updated.
+
+* `grow = TRUE` (the default) first applies one period of RD growth, as at the
+  start of the next period.
+* `grow = FALSE` uses the deviations as they are.
+* Unknown players and pairs get the initial values.
+
+```{r}
+new_games <- data.frame(Player1 = c("Rock", "Paper", "Scissors", "Ace", "Newcomer"),
+                        Player2 = c("Scissors", "Rock", "Paper", "Echo", "Ace"))
+# true probabilities from rps_truth (stored once per pair)
+truth <- function(a, b) {
+  i <- which(rps_truth$Player1 == a & rps_truth$Player2 == b)
+  j <- which(rps_truth$Player1 == b & rps_truth$Player2 == a)
+  if (length(i)) rps_truth$prob[i] else if (length(j)) 1 - rps_truth$prob[j] else NA
+}
+cbind(new_games,
+      Glicko  = predict(g, new_games),
+      PGlicko = predict(p, new_games),
+      truth   = mapply(truth, new_games$Player1, new_games$Player2))
+```
+
+# 8. Practical notes
+
+## RD growth and the size of $c$
+
+Glicko's $c$ adds uncertainty between periods, so that ratings can follow
+players whose strength changes. The default $c = 63.2$ is large for data like
+`rps_league`, where strengths never change and every player plays every period.
+Here, RD growth erases most of what each period teaches:
+
+* ratings move more from period to period;
+* the likelihood prefers a tiny $\sigma_0$, because the RD reaches its
+  growth/update balance within a few periods whatever value it starts at.
+
+Compare:
+
+```{r}
+fg63 <- glicko_fit(rps_league)          # c_rd = 63.2
+fp63 <- pglicko_fit(rps_league)
+rbind(`Glicko c=63.2`  = c(fg63$par, init_pair_sd = NA, logloss = fg63$test$logloss),
+      `Glicko c=0`     = c(fg$par,   init_pair_sd = NA, logloss = fg$test$logloss),
+      `PGlicko c=63.2` = c(fp63$par, logloss = fp63$test$logloss),
+      `PGlicko c=0`    = c(fp$par,   logloss = fp$test$logloss))
+```
+
+With $c = 63.2$:
+
+* the fitted $\sigma_0$ sits at or near the lower end of the search range, which
+  means it is poorly identified;
+* the test log loss is worse, for both models.
+
+None of this is an error. It shows that $c$ should suit the competition: use
+`c_rd = 0` for stationary strengths, and larger values when strengths drift or
+players are often inactive. You can also choose $c$ by comparing the test log
+loss or the likelihood over a small grid.
+
+`pglicko_fit()` uses Nelder–Mead by default, which does not keep the parameters
+positive. Values ≤ 0 give a log-likelihood of $-\infty$, so the search avoids
+them. For a bounded search, use `method = "L-BFGS-B"` with `lower` and `upper`.
+
+## Memory and speed
+
+Pairwise values are stored only for pairs that have played, in the `pairs`
+table. Memory therefore grows with the number of pairs that meet, not with the
+square of the number of players, and a competition with tens of thousands of
+players is fine as long as each plays a limited set of opponents. The work in
+each period is vectorised over that period's games. `pair_matrix()` and
+`keep_history = TRUE` build dense matrices, so use them only when the number of
+players is moderate.
+
+# 9. Relation to the research scripts
+
+The package reproduces `Glicko_functions_optimized_v4.R` and
+`PGlicko_functions_optimized_v3.R` from this repository. The log-likelihoods,
+predictions, ratings and pairwise values agree exactly, and `pglicko_fit()`
+reaches the same optimum as the `optim()` call in `Train_all_models.R`.
+
+| script                                     | package                                                  |
+|--------------------------------------------|----------------------------------------------------------|
+| `get_like(sig0, data)` (Glicko)            | `glicko_loglik(sig0, data)`                              |
+| `get_like(c(sig0, b0), data)` (P-Glicko)   | `pglicko_loglik(c(sig0, b0), data)`                      |
+| `get_like(..., metric = "all")`            | `..._loglik(..., metric = "all")`                        |
+| `optim(c(300, 300), get_like, ...)`        | `pglicko_fit(data)`                                      |
+| `optimize(get_like, c(1, 1000), ...)`      | `glicko_fit(data)`                                       |
+| global `record` data frame                 | `fit$trace`                                              |
+| `pglicko_phase(para, data, state)`         | `pglicko_run(data, sig0, b0, start = previous_run)`      |
+| `state$Ratings`, `state$pairs`             | `run$ratings`, `run$pairs`                               |
+| `rdmax`, `c_rd`, `train_frac`              | `rd_max`, `c_rd`, `train_frac` arguments                 |
+
+The differences are:
+
+* the package checks its inputs and keeps no global state;
+* it keeps player names in the output;
+* AUC uses a fixed direction (see section 5).
+
+# References
+
+* Glickman, M. E. (1999). Parameter estimation in large dynamic paired
+  comparison experiments. *Journal of the Royal Statistical Society: Series C*,
+  48(3), 377–394.
+* Wong, K. H. *et al.* P-Glicko: a pairwise Glicko rating system for
+  intransitive competitions (manuscript).
